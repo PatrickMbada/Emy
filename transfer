@@ -1,61 +1,256 @@
+##################################################
+# TASK3922826 -  BQ Compute Project for          #
+# for Pipeline Metrics                           #
+# see ticket for details of original request     #
+##################################################
+
+# Define Modules here
+# Billing module for this project
+
+module "billinglabels_osdt_scm" {
+  source     = "git::https://gitlab.gcp.davita.com/shared-services/billing/accounting-labels-for-gcp-resources.git//terraform-module?ref=v1.1.2"
+  project_id = "scm-bq-comp-${local.env}-${random_string.random.result}"
+  token      = var.google_identity_token
+}
+
+# declaring locals for vault entries - no vault entries specified in original request
+locals {
+  scm_project_id = google_project.scm_bq_comp.project_id
+  # This avoids name conflicts in review environments
+  # scm_ksa_name = element(local.namespace, 0) == "default" ? "scm-${local.env_id}-${random_string.random.result}" : "scm"
+}
+
+resource "google_project" "scm_bq_comp" {
+  name                = "SCM-Metrics-BQ-Compute-Proj"
+  project_id          = "scm-bq-comp-${local.env}-${random_string.random.result}"
+  folder_id           = local.gcp_folder_id
+  billing_account     = local.gcp_billing_account
+  auto_create_network = false
+  deletion_policy     = contains(local.permanent_envs, terraform.workspace) ? "PREVENT" : "DELETE"
+  labels              = local.resource_labels
+}
+
+# will check api for looker, cloud sql and cloud storage
+# these might already be included in the program level
+# below are APIs only for bq
+resource "google_project_service" "scm_bq_comp" {
+  for_each = toset([
+    "cloudbilling.googleapis.com",
+    "compute.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "cloudprofiler.googleapis.com",
+    "bigquery.googleapis.com"
+  ])
+  project                    = google_project.scm_bq_comp.project_id
+  service                    = each.value
+  disable_on_destroy         = false
+  disable_dependent_services = false
+}
+
+# per CKV2_GCP_5, Ensure that Cloud Audit Logging is configured
+# properly across all services and all users from a project
+
+resource "google_project_iam_audit_config" "scm_bq_comp_audit" {
+  project = google_project.scm_bq_comp.project_id
+  service = "allServices"
+  audit_log_config {
+    log_type = "ADMIN_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}
+
+# Dataset
+# per TASK# request, dataset encryption is not required
+
+resource "google_bigquery_dataset" "bode" {
+  project                    = google_project_service.scm_bq_comp["bigquery.googleapis.com"].project
+  dataset_id                 = "bode"
+  location                   = "US"
+  delete_contents_on_destroy = false
+  access {
+    special_group = "projectOwners"
+    role          = "OWNER"
+  }
+  depends_on = [google_project_service.scm_bq_comp]
+}
+
+# #########################
+# Project Service Account #
+# #########################
+
+resource "google_service_account" "scm_bq_comp_sa" {
+  account_id   = "scm-bq-comp-${local.env}-${local.p_or_np}-sa"
+  display_name = "SCM-bq-comp-${local.p_or_np}-SA"
+  project      = google_project.scm_bq_comp.project_id
+}
+
+resource "google_project_iam_member" "scm_bq_comp_iam_member" {
+  for_each = toset([
+    "roles/bigquery.jobUser",
+    #"roles/bigquery.dataViewer",
+    "roles/bigquery.dataEditor",
+  ])
+  project = google_project_service.scm_bq_comp["bigquery.googleapis.com"].project
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.scm_bq_comp_sa.email}"
+}
+
+# Adding Jenkins SA
+
+resource "google_service_account" "jenkins_scm_sa" {
+  account_id   = "jenkins-scm-${local.env_short_id}-${local.p_or_np}-sa"
+  display_name = "Jenkins-scm-${local.p_or_np}-SA"
+  project      = google_project.scm_bq_comp.project_id
+}
+
+resource "google_project_iam_member" "jenkins_scm_iam_member" {
+  for_each = toset([
+    "roles/bigquery.jobUser",
+    "roles/bigquery.dataEditor",
+  ])
+  project = google_project_service.scm_bq_comp["bigquery.googleapis.com"].project
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.jenkins_scm_sa.email}"
+}
+
+###############################################
+# Vault roleset, policy, approle for Jenkins  #
+###############################################
+
+resource "vault_gcp_secret_roleset" "jenkins_scm_roleset" {
+  backend     = local.vault_gcp_backend_path
+  roleset     = "jenkins-osdt-${local.env_short_id}-${random_string.random.result}"
+  secret_type = "service_account_key"
+  # token_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+  # project = local.scm_project_id
+  project = google_project.scm_bq_comp.project_id
+  binding {
+    resource = "//cloudresourcemanager.googleapis.com/projects/${google_project.scm_bq_comp.project_id}"
+    roles = [
+      "roles/bigquery.jobUser",
+      "roles/bigquery.dataEditor",
+    ]
+  }
+  # depends_on = [time_sleep.wait_3]
+}
+
+# Create a policy for the roleset
+resource "vault_policy" "jenkins_scm_policy" {
+  name   = "${local.p_or_np}/${vault_gcp_secret_roleset.jenkins_scm_roleset.roleset}"
+  policy = <<-EOT
+     # Allows app to generate GCP key for this roleset
+     path "${local.vault_gcp_backend_path}/key/${vault_gcp_secret_roleset.jenkins_scm_roleset.roleset}" {
+     capabilities = ["read", "create", "list"]
+     }
+   EOT
+}
+
+# create an approle role
+resource "vault_approle_auth_backend_role" "jenkins_scm_approle" {
+  backend        = local.vault_approle_backend_path
+  role_name      = "jenkins-scm-${local.env_short_id}-${random_string.random.result}"
+  token_policies = ["default", vault_policy.jenkins_scm_policy.name]
+}
+
+
+# #########################
+# Group Access           #
+# #########################
+# note this is temp, this is new project and the group still don't have -p for prod
+
+resource "google_project_iam_member" "gcp_sdlc_scm_iam_member" {
+  for_each = toset([
+    "roles/bigquery.jobUser",
+    #"roles/bigquery.dataViewer",
+    "roles/bigquery.dataEditor",
+  ])
+  project = google_project_service.scm_bq_comp["bigquery.googleapis.com"].project
+  role    = each.value
+  member  = "group:gcp-sdlc-scm@davita.com"
+}
+
+#######################################
+# Bucket Required for ETL #
+#######################################
+
+resource "google_storage_bucket" "infa_scm_bucket" {
+  name                        = "infa-scm-${local.env_short_id}-${random_id.suffix.hex}-${local.p_or_np}"
+  project                     = google_project.scm_bq_comp.project_id
+  force_destroy               = true
+  uniform_bucket_level_access = true
+  location                    = "US"
+}
+
 ###################################################
 # Datastream Resources for MySQL to BigQuery Data Transfer
 ###################################################
 
 # MySQL Source Connection Profile
 resource "google_datastream_connection_profile" "mysql_source" {
-  name     = "mysql-source-${local.env}-${random_string.random.result}"
-  project  = google_project.scm_bq_comp.project_id
-  location = "us-central1"
+  display_name          = ""
+  connection_profile_id = "my-profile"
+  name                  = "mysql-source-${local.env}-${random_string.random.result}"
+  project               = google_project.scm_bq_comp.project_id
+  location              = "us-central1"
 
-  mysql {
+  mysql_profile {
+    password = {
+      secret_manager_secret_version = var.mysql_password_secret_version
+    }
     hostname = var.mysql_hostname
     port     = var.mysql_port
     username = var.mysql_username
-    password {
-      secret_manager_secret_version = var.mysql_password_secret_version
-    }
-    ssl_config {
-      client_key {
-        secret_manager_secret_version = var.mysql_client_key_secret_version
-      }
-      client_certificate {
-        secret_manager_secret_version = var.mysql_client_cert_secret_version
-      }
-      ca_certificate {
-        secret_manager_secret_version = var.mysql_ca_cert_secret_version
-      }
-    }
+    # ssl_config {
+    #   client_key {
+    #     secret_manager_secret_version = var.mysql_client_key_secret_version
+    #   }
+    #   client_certificate {
+    #     secret_manager_secret_version = var.mysql_client_cert_secret_version
+    #   }
+    #   ca_certificate {
+    #     secret_manager_secret_version = var.mysql_ca_cert_secret_version
+    #   }
+    # }
   }
 }
 
 # BigQuery Destination Connection Profile
 resource "google_datastream_connection_profile" "bq_destination" {
-  name     = "bq-destination-${local.env}-${random_string.random.result}"
-  project  = google_project.scm_bq_comp.project_id
-  location = "us-central1"
+  display_name          = ""
+  connection_profile_id = "my-profile"
+  name                  = "bq-destination-${local.env}-${random_string.random.result}"
+  project               = google_project.scm_bq_comp.project_id
+  location              = "us-central1"
 
-  gcs {
-    bucket_name = google_storage_bucket.infa_scm_bucket.name
-    root_path   = "datastream-output/"
+  gcs_profile {
+    bucket    = google_storage_bucket.infa_scm_bucket.name
+    root_path = "datastream-output/"
   }
 }
 
 # Datastream Stream Configuration
 resource "google_datastream_stream" "mysql_to_bq_stream" {
-  name       = "mysql-to-bq-stream-${local.env}-${random_string.random.result}"
-  project    = google_project.scm_bq_comp.project_id
-  location   = "us-central1"
-  state      = "RUNNING"
+  stream_id    = ""
+  name         = "mysql-to-bq-stream-${local.env}-${random_string.random.result}"
+  project      = google_project.scm_bq_comp.project_id
+  location     = "us-central1"
+  state        = "RUNNING"
   display_name = "MySQL to BigQuery Stream - ${local.env}"
+  labels = {
+    "key" = "value"
+  }
 
   source_config {
     source_connection_profile = google_datastream_connection_profile.mysql_source.id
     mysql_source_config {
       include_objects {
-        mysql_objects {
+        mysql_databases {
           database = var.mysql_database
-          table    = var.mysql_tables # e.g., "users", "orders"
         }
       }
     }
@@ -71,9 +266,8 @@ resource "google_datastream_stream" "mysql_to_bq_stream" {
 
   backfill_all {
     mysql_excluded_objects {
-      mysql_objects {
+      mysql_databases {
         database = var.exclude_database
-        table    = var.exclude_tables # Optional exclusion
       }
     }
   }
@@ -83,63 +277,4 @@ resource "google_datastream_stream" "mysql_to_bq_stream" {
     google_datastream_connection_profile.bq_destination,
     google_bigquery_dataset.bode
   ]
-}
-
-
-variable "mysql_hostname" {
-  description = "MySQL source hostname"
-  type        = string
-}
-
-variable "mysql_port" {
-  description = "MySQL source port"
-  type        = number
-  default     = 3306
-}
-
-variable "mysql_username" {
-  description = "MySQL source username"
-  type        = string
-}
-
-variable "mysql_password_secret_version" {
-  description = "Secret Manager version for MySQL password"
-  type        = string
-}
-
-variable "mysql_client_key_secret_version" {
-  description = "Secret Manager version for MySQL client key"
-  type        = string
-}
-
-variable "mysql_client_cert_secret_version" {
-  description = "Secret Manager version for MySQL client certificate"
-  type        = string
-}
-
-variable "mysql_ca_cert_secret_version" {
-  description = "Secret Manager version for MySQL CA certificate"
-  type        = string
-}
-
-variable "mysql_database" {
-  description = "MySQL database name to replicate"
-  type        = string
-}
-
-variable "mysql_tables" {
-  description = "MySQL tables to replicate"
-  type        = list(string)
-}
-
-variable "exclude_database" {
-  description = "MySQL database to exclude from replication"
-  type        = string
-  default     = ""
-}
-
-variable "exclude_tables" {
-  description = "MySQL tables to exclude from replication"
-  type        = list(string)
-  default     = []
 }
